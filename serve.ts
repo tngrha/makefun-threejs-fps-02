@@ -1,18 +1,13 @@
-// A tiny static server for game/ (Node 22, standard library only), so the
-// game can be played locally without a build step: `node serve.ts` serves
-// game/ on http://localhost:8080. It sends the MIME types a browser game
-// needs, refuses any path outside game/, and otherwise does nothing clever:
-// a development convenience, not a web server for the internet.
-import { createReadStream, statSync } from 'node:fs';
+// DUSTLINE local preview server: serves game/ over plain HTTP so the entry
+// can be played and screenshotted from a browser. Node 22 standard library
+// only; defaults to http://127.0.0.1:8080, or --port N (validated 1..65535).
 import { createServer } from 'node:http';
-import { extname, join, normalize, resolve, sep } from 'node:path';
+import { readFileSync, existsSync, statSync } from 'node:fs';
+import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = resolve(fileURLToPath(new URL('./game', import.meta.url)));
-const args = process.argv.slice(2);
-const portIndex = args.indexOf('--port');
-const requested = portIndex === -1 ? 8080 : Number(args[portIndex + 1]);
-const port = Number.isInteger(requested) && requested > 0 && requested < 65536 ? requested : 8080;
+const here = dirname(fileURLToPath(import.meta.url));
+const gameDir = resolve(join(here, 'game'));
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -25,36 +20,41 @@ const MIME = {
   '.jpeg': 'image/jpeg',
 };
 
-createServer((request, response) => {
-  const url = new URL(request.url ?? '/', 'http://localhost');
-  let pathname;
-  try {
-    pathname = decodeURIComponent(url.pathname);
-  } catch {
-    response.writeHead(400).end('bad request');
+let port = 8080;
+const portFlag = process.argv.indexOf('--port');
+if (portFlag !== -1) {
+  const value = Number(process.argv[portFlag + 1]);
+  if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    console.error(`--port must be an integer from 1 to 65535, not ${process.argv[portFlag + 1]}`);
+    process.exit(1);
+  }
+  port = value;
+}
+
+const server = createServer((req, res) => {
+  const rawPath = decodeURIComponent(new URL(req.url || '/', 'http://127.0.0.1').pathname);
+  const relPath = rawPath === '/' ? 'index.html' : rawPath.replace(/^\//, '');
+  const filePath = resolve(join(gameDir, relPath));
+  // Refuse anything that climbs out of game/.
+  if (filePath !== gameDir && !filePath.startsWith(`${gameDir}/`)) {
+    res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    res.end('forbidden\n');
     return;
   }
-  if (pathname.endsWith('/')) pathname += 'index.html';
-  const file = resolve(join(root, normalize(pathname)));
-  if (file !== root && !file.startsWith(root + sep)) {
-    response.writeHead(403).end('forbidden');
+  if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    res.end('not found\n');
     return;
   }
-  let size;
-  try {
-    const stats = statSync(file);
-    if (!stats.isFile()) throw new Error('not a file');
-    size = stats.size;
-  } catch {
-    response.writeHead(404).end('not found');
-    return;
-  }
-  response.writeHead(200, {
-    'content-type': MIME[extname(file).toLowerCase()] ?? 'application/octet-stream',
-    'content-length': size,
+  const body = readFileSync(filePath);
+  res.writeHead(200, {
+    'content-type': MIME[extname(filePath).toLowerCase()] || 'application/octet-stream',
+    'content-length': body.length,
     'cache-control': 'no-store',
   });
-  createReadStream(file).pipe(response);
-}).listen(port, '127.0.0.1', () => {
-  console.log(`game/ is on http://localhost:${port}`);
+  res.end(body);
+});
+
+server.listen(port, '127.0.0.1', () => {
+  console.log(`DUSTLINE serving game/ at http://127.0.0.1:${port}/`);
 });
