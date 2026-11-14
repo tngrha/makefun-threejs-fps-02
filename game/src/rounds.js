@@ -1,157 +1,230 @@
-// The match: rounds, money, the buy menu, the bomb, and the grenade. The
-// player attacks alone against four defenders. A round is won by eliminating
-// the defence, or by planting the bomb and letting it go off; it is lost when
-// the player dies, the clock runs out with no plant, or the defence defuses.
-// First to 5 rounds takes the match (at most 9 rounds).
+// Round flow for Yard 7: buy, live, round end, match end. One attacker
+// against four defenders, first to 5 rounds (at most 9 played). Money pays
+// for kills, plants and round results; the buy menu spends it on guns and a
+// grenade. The bomb is planted by standing still inside a site, ticks down
+// a 40 s fuse, and can be defused by a defender who reaches it in time.
+// Grenades thrown in a round keep flying until their fuse runs out, even
+// across the round boundary.
 import * as THREE from 'three';
-import { WEAPONS } from './weapon.js';
 
-const ROUND_TIME = 100;
-const BUY_TIME = 12;
-const ROUND_END_TIME = 4;
-const PLANT_TIME = 3.5;
-const FUSE_TIME = 40;
-const DEFUSE_TIME = 5;
-const WIN_ROUNDS = 5;
+const PRICES = { hornet: 1500, vk47: 2700, grenade: 300 };
+const WIN_SCORE = 5;
 const MAX_ROUNDS = 9;
-const GRENADE_PRICE = 300;
-const GRENADE_MAX_DAMAGE = 90;
-const GRENADE_RADIUS = 6;
+const BUY_SECONDS = 12;
+const LIVE_SECONDS = 100;
+const END_SECONDS = 4;
+const PLANT_SECONDS = 3.5;
+const FUSE_SECONDS = 40;
+const SHELL_FUSE = 1.2;
+const SHELL_SPEED = 16;
+const SHELL_LIFT = 3.5;
+const GRAVITY = 20;
+const KILL_REWARD = 300;
+const PLANT_REWARD = 300;
+const WIN_REWARD = 2200;
+const LOSS_REWARD = 1400;
+const START_MONEY = 800;
+
+const ROUND_END_COPY = {
+  eliminated: ['The yard is clear.', 'Every defender is down.'],
+  bomb: ['The bomb did the work.', 'Site destroyed — the yard is yours.'],
+  time: ['Out of time.', 'The clock ran out with no plant.'],
+  defused: ['The bomb was defused.', 'A defender cut the wires in time.'],
+  killed: ['You went down.', 'The defence held the yard.'],
+};
+
+function freshBomb() {
+  return { planted: false, site: null, fuse: FUSE_SECONDS, exploded: false, defuseProgress: 0, lastBeep: FUSE_SECONDS };
+}
+
+function positionOf(player) {
+  if (!player) return null;
+  if (player.state && player.state.position) return player.state.position;
+  return player.position || null;
+}
 
 export function createRounds(world, onEvent) {
   const state = {
-    phase: 'buy', // buy | live | roundEnd | matchEnd
+    phase: 'buy',
     round: 1,
     scoreYou: 0,
     scoreThem: 0,
-    money: 800,
-    timer: BUY_TIME,
+    money: START_MONEY,
+    timer: BUY_SECONDS,
     owned: new Set(['p9']),
     grenades: 0,
     plantProgress: 0,
-    bomb: { planted: false, site: null, fuse: 0, exploded: false, defuseProgress: 0 },
+    bomb: freshBomb(),
     banner: null,
   };
-  const grenades = [];
-  const tmp = new THREE.Vector3();
+  const shells = [];
+  let lastBots = null;
 
-  function siteAt(x, z) {
-    for (const site of world.sites) {
-      if (Math.hypot(x - site.x, z - site.z) <= site.radius) return site;
-    }
-    return null;
+  function openBuyPhase() {
+    state.phase = 'buy';
+    state.timer = BUY_SECONDS;
+    state.plantProgress = 0;
+    state.bomb = freshBomb();
+    state.banner = null;
+    onEvent('buy-phase', { round: state.round });
   }
 
-  function endRound(youWon, reason) {
-    if (state.phase !== 'live') return;
-    state.phase = 'roundEnd';
-    state.timer = ROUND_END_TIME;
-    if (youWon) {
-      state.scoreYou += 1;
-      state.money += 2200;
-    } else {
-      state.scoreThem += 1;
-      state.money += 1400;
-    }
-    state.banner = { text: youWon ? 'ROUND WON' : 'ROUND LOST', sub: reason };
-    if (onEvent) onEvent(youWon ? 'round-win' : 'round-lose', { reason });
+  function startRound() {
+    if (state.phase !== 'buy') return false;
+    state.phase = 'live';
+    state.timer = LIVE_SECONDS;
+    state.plantProgress = 0;
+    state.bomb = freshBomb();
+    state.banner = null;
+    onEvent('round-start', { round: state.round });
+    return true;
+  }
+
+  function nextRound() {
+    state.round += 1;
+    openBuyPhase();
+  }
+
+  function resetMatch() {
+    state.round = 1;
+    state.scoreYou = 0;
+    state.scoreThem = 0;
+    state.money = START_MONEY;
+    state.owned = new Set(['p9']);
+    state.grenades = 0;
+    shells.length = 0;
+    openBuyPhase();
+  }
+
+  function matchOver() {
+    return state.scoreYou >= WIN_SCORE || state.scoreThem >= WIN_SCORE || state.round >= MAX_ROUNDS;
   }
 
   function endMatch() {
     state.phase = 'matchEnd';
-    if (onEvent) onEvent(state.scoreYou > state.scoreThem ? 'match-win' : 'match-lose', {});
-  }
-
-  function startRound() {
-    state.phase = 'live';
-    state.timer = ROUND_TIME;
-    state.plantProgress = 0;
-    state.bomb = { planted: false, site: null, fuse: 0, exploded: false, defuseProgress: 0 };
-    if (onEvent) onEvent('round-start', { round: state.round });
-  }
-
-  function nextRound() {
-    if (state.scoreYou >= WIN_ROUNDS || state.scoreThem >= WIN_ROUNDS || state.round >= MAX_ROUNDS) {
-      endMatch();
-      return;
-    }
-    state.round += 1;
-    state.phase = 'buy';
-    state.timer = BUY_TIME;
+    state.timer = 0;
     state.banner = null;
-    if (onEvent) onEvent('buy-phase', { round: state.round });
+    if (state.scoreYou > state.scoreThem) onEvent('match-win', { you: state.scoreYou, them: state.scoreThem });
+    else onEvent('match-lose', { you: state.scoreYou, them: state.scoreThem });
+  }
+
+  function endRound(win, reason) {
+    if (state.phase !== 'live') return;
+    state.phase = 'roundEnd';
+    state.timer = END_SECONDS;
+    state.plantProgress = 0;
+    const copy = ROUND_END_COPY[reason] || ROUND_END_COPY.eliminated;
+    if (win) {
+      state.scoreYou += 1;
+      state.money += WIN_REWARD;
+      state.banner = { text: 'ROUND WON', sub: copy[1] };
+      onEvent('round-win', { reason });
+    } else {
+      state.scoreThem += 1;
+      state.money += LOSS_REWARD;
+      state.banner = { text: 'ROUND LOST', sub: copy[1] };
+      onEvent('round-lose', { reason });
+    }
   }
 
   function buy(id) {
     if (state.phase !== 'buy') return false;
+    const price = PRICES[id];
+    if (price === undefined) return false;
     if (id === 'grenade') {
-      if (state.grenades >= 1 || state.money < GRENADE_PRICE) return false;
-      state.money -= GRENADE_PRICE;
+      if (state.grenades >= 1 || state.money < price) return false;
+      state.money -= price;
       state.grenades = 1;
-      if (onEvent) onEvent('bought', { id });
-      return true;
+    } else {
+      if (state.owned.has(id) || state.money < price) return false;
+      state.money -= price;
+      state.owned.add(id);
     }
-    const def = WEAPONS[id];
-    if (!def || state.owned.has(id) || state.money < def.price) return false;
-    state.money -= def.price;
-    state.owned.add(id);
-    if (onEvent) onEvent('bought', { id });
+    onEvent('bought', { id });
     return true;
   }
 
-  function throwGrenade(origin, direction, rng) {
-    if (state.grenades <= 0) return false;
+  function throwGrenade(origin, direction) {
+    if (state.phase !== 'live' || state.grenades <= 0) return false;
     state.grenades -= 1;
-    const vel = direction.clone().multiplyScalar(16);
-    vel.y += 3.5;
-    grenades.push({ pos: origin.clone(), vel, fuse: 1.2 });
-    if (onEvent) onEvent('thrown', {});
+    const velocity = direction.clone().multiplyScalar(SHELL_SPEED);
+    velocity.y += SHELL_LIFT;
+    shells.push({ position: origin.clone(), velocity, fuse: SHELL_FUSE });
+    onEvent('thrown', {});
     return true;
   }
 
-  function explodeGrenade(g, bots, player, fx, audio) {
-    if (fx) fx.explosion(g.pos);
-    if (audio) audio.play('explosion');
-    for (const bot of bots.bots) {
-      if (!bot.alive) continue;
-      const dist = Math.hypot(bot.position.x - g.pos.x, bot.position.z - g.pos.z);
-      if (dist > GRENADE_RADIUS) continue;
-      const damage = Math.round(GRENADE_MAX_DAMAGE * (1 - dist / GRENADE_RADIUS) + 20);
-      if (bots.damage(bot.parts.torso, damage) && onEvent) onEvent('bot-killed', { bot, by: 'grenade' });
+  function siteAt(pos) {
+    if (!pos) return null;
+    for (const site of world.sites) {
+      if (Math.hypot(site.x - pos.x, site.z - pos.z) <= site.radius) return site;
     }
-    if (player.alive) {
-      const dist = Math.hypot(player.position.x - g.pos.x, player.position.z - g.pos.z);
-      if (dist < 4) {
-        const damage = Math.round(40 * (1 - dist / 4));
-        if (onEvent) onEvent('player-damaged', { damage, source: 'grenade' });
+    return null;
+  }
+
+  function explodeShell(shell, player, bots, fx, audio) {
+    const at = shell.position.clone();
+    fx.explosion(at);
+    audio.play('explosion');
+    if (bots) {
+      for (const bot of bots.bots) {
+        if (!bot.alive) continue;
+        const d = Math.hypot(bot.position.x - at.x, bot.position.z - at.z);
+        if (d >= 6) continue;
+        const damage = Math.round(20 + 90 * (1 - d / 6));
+        bots.damage(bot.parts.torso, damage);
+      }
+    }
+    const pos = positionOf(player);
+    if (pos) {
+      const d = Math.hypot(pos.x - at.x, pos.z - at.z);
+      if (d < 4) {
+        const damage = Math.round(40 * (1 - d / 4));
+        if (damage > 0) onEvent('player-damaged', { damage, source: 'grenade' });
+      }
+    }
+  }
+
+  function stepShells(dt, player, bots, fx, audio) {
+    for (let i = shells.length - 1; i >= 0; i -= 1) {
+      const shell = shells[i];
+      shell.fuse -= dt;
+      shell.velocity.y -= GRAVITY * dt;
+      // Move one axis at a time so a wall bounce only kills that component.
+      const nx = shell.position.x + shell.velocity.x * dt;
+      if (!world.overlaps(nx, shell.position.y, shell.position.z, 0.1, 0.2, 0)) shell.position.x = nx;
+      else shell.velocity.x = -shell.velocity.x * 0.45;
+      const nz = shell.position.z + shell.velocity.z * dt;
+      if (!world.overlaps(shell.position.x, shell.position.y, nz, 0.1, 0.2, 0)) shell.position.z = nz;
+      else shell.velocity.z = -shell.velocity.z * 0.45;
+      const ny = shell.position.y + shell.velocity.y * dt;
+      if (ny < 0.12) {
+        shell.position.y = 0.12;
+        shell.velocity.y = -shell.velocity.y * 0.45;
+        shell.velocity.x *= 0.8;
+        shell.velocity.z *= 0.8;
+        if (Math.abs(shell.velocity.y) < 0.6) shell.velocity.y = 0;
+      } else if (!world.overlaps(shell.position.x, ny, shell.position.z, 0.1, 0.2, 0)) {
+        shell.position.y = ny;
+      } else {
+        shell.velocity.y = -shell.velocity.y * 0.45;
+      }
+      if (shell.fuse <= 0) {
+        shells.splice(i, 1);
+        explodeShell(shell, player, bots, fx, audio);
       }
     }
   }
 
   function step(dt, player, keys, bots, fx, audio, rng) {
-    // Grenades fly even between rounds, so they resolve before the phase.
-    for (let i = grenades.length - 1; i >= 0; i -= 1) {
-      const g = grenades[i];
-      g.fuse -= dt;
-      g.vel.y -= 20 * dt;
-      const next = tmp.copy(g.pos).addScaledVector(g.vel, dt);
-      let bounced = false;
-      if (world.overlaps(next.x, g.pos.y, g.pos.z, 0.12, 0.24, 0)) { g.vel.x *= -0.45; bounced = true; }
-      else g.pos.x = next.x;
-      if (world.overlaps(g.pos.x, g.pos.y, next.z, 0.12, 0.24, 0)) { g.vel.z *= -0.45; bounced = true; }
-      else g.pos.z = next.z;
-      if (next.y < 0.12) {
-        g.pos.y = 0.12;
-        g.vel.y = Math.abs(g.vel.y) * 0.45;
-        bounced = true;
-      } else {
-        g.pos.y = next.y;
-      }
-      if (bounced) { g.vel.x *= 0.8; g.vel.z *= 0.8; }
-      if (g.fuse <= 0) {
-        grenades.splice(i, 1);
-        explodeGrenade(g, bots, player, fx, audio);
-      }
+    lastBots = bots;
+    stepShells(dt, player, bots, fx, audio);
+
+    // Mirror the closest defender's defuse effort for the HUD bar.
+    if (state.bomb.planted && bots) {
+      let best = 0;
+      for (const bot of bots.bots) if (bot.alive) best = Math.max(best, bot.defuseProgress || 0);
+      state.bomb.defuseProgress = best;
     }
 
     if (state.phase === 'buy') {
@@ -159,77 +232,65 @@ export function createRounds(world, onEvent) {
       if (state.timer <= 0) startRound();
       return;
     }
+
     if (state.phase === 'roundEnd') {
       state.timer -= dt;
-      if (state.timer <= 0) nextRound();
+      if (state.timer <= 0) {
+        if (matchOver()) endMatch();
+        else nextRound();
+      }
       return;
     }
+
     if (state.phase !== 'live') return;
 
     state.timer -= dt;
-    if (state.timer <= 0 && !state.bomb.planted) {
-      endRound(false, 'Time expired — the bomb never went down.');
-      return;
-    }
+    const pos = positionOf(player);
+    const speed = player && typeof player.groundSpeed === 'function' ? player.groundSpeed() : 0;
 
-    // Planting: hold E inside a site, standing mostly still.
-    if (!state.bomb.planted && player.alive && keys.has('KeyE')) {
-      const site = siteAt(player.position.x, player.position.z);
-      const speed = Math.hypot(player.velocity.x, player.velocity.z);
-      if (site && speed < 1.5) {
-        state.plantProgress += dt;
-        if (state.plantProgress >= PLANT_TIME) {
-          state.bomb = { planted: true, site, fuse: FUSE_TIME, exploded: false, defuseProgress: 0 };
-          state.plantProgress = 0;
-          state.money += 300;
-          if (onEvent) onEvent('planted', { site: site.name });
+    // Planting: hold E, standing nearly still, inside a site.
+    if (!state.bomb.planted && pos && keys && keys.has('KeyE') && speed < 1.5) {
+      const site = siteAt(pos);
+      if (site) {
+        state.plantProgress += dt / PLANT_SECONDS;
+        if (state.plantProgress >= 1) {
+          state.plantProgress = 1;
+          state.bomb.planted = true;
+          state.bomb.site = site;
+          state.bomb.fuse = FUSE_SECONDS;
+          state.bomb.lastBeep = FUSE_SECONDS;
+          state.money += PLANT_REWARD;
+          audio.play('plant');
+          onEvent('planted', { site });
         }
-      } else {
-        state.plantProgress = Math.max(0, state.plantProgress - dt * 2);
       }
-    } else {
-      state.plantProgress = Math.max(0, state.plantProgress - dt * 2);
     }
 
+    // The planted bomb ticks down, beeping each second until it blows.
     if (state.bomb.planted && !state.bomb.exploded) {
       state.bomb.fuse -= dt;
-      const secondsLeft = Math.ceil(state.bomb.fuse);
-      if (secondsLeft !== state.bomb.lastBeep) {
-        state.bomb.lastBeep = secondsLeft;
-        if (audio) audio.play('beep');
+      const whole = Math.ceil(state.bomb.fuse);
+      if (whole < state.bomb.lastBeep) {
+        state.bomb.lastBeep = whole;
+        audio.play('beep');
       }
       if (state.bomb.fuse <= 0) {
         state.bomb.exploded = true;
-        if (fx) fx.explosion(new THREE.Vector3(state.bomb.site.x, 0.6, state.bomb.site.z));
-        if (audio) audio.play('explosion');
-        endRound(true, 'The bomb went off at site ' + state.bomb.site.name + '.');
+        const site = state.bomb.site;
+        fx.explosion(new THREE.Vector3(site.x, 0.5, site.z));
+        audio.play('explosion');
+        endRound(true, 'bomb');
+        return;
       }
     }
-  }
 
-  function resetMatch() {
-    state.phase = 'buy';
-    state.round = 1;
-    state.scoreYou = 0;
-    state.scoreThem = 0;
-    state.money = 800;
-    state.timer = BUY_TIME;
-    state.owned = new Set(['p9']);
-    state.grenades = 0;
-    state.plantProgress = 0;
-    state.bomb = { planted: false, site: null, fuse: 0, exploded: false, defuseProgress: 0 };
-    state.banner = null;
-    grenades.length = 0;
-    if (onEvent) onEvent('buy-phase', { round: 1 });
-  }
-
-  function onBotKilled(bot) {
-    state.money += 300;
-    if (onEvent) onEvent('kill-reward', { bot });
-  }
-
-  function onPlayerKilled() {
-    endRound(false, 'You were eliminated.');
+    if (bots && bots.aliveCount() === 0) {
+      endRound(true, 'eliminated');
+      return;
+    }
+    if (state.timer <= 0 && !state.bomb.planted) {
+      endRound(false, 'time');
+    }
   }
 
   return {
@@ -242,11 +303,17 @@ export function createRounds(world, onEvent) {
     startRound,
     nextRound,
     resetMatch,
-    onBotKilled,
-    onPlayerKilled,
+    onBotKilled(bot, by) {
+      if (state.phase !== 'live') return;
+      state.money += KILL_REWARD;
+      onEvent('kill-reward', { bot, by });
+    },
+    onPlayerKilled() {
+      if (state.phase === 'live') endRound(false, 'killed');
+    },
     siteAt,
-    aliveBots(bots) {
-      return bots.aliveCount();
+    aliveBots() {
+      return lastBots ? lastBots.aliveCount() : 0;
     },
   };
 }
